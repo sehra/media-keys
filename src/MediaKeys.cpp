@@ -4,12 +4,60 @@
 #include "resource.h"
 
 #define WM_TRAYICON (WM_USER + 1)
+constexpr auto ID_TRAY_AUTOSTART = 1000;
 constexpr auto ID_TRAY_EXIT = 1001;
 constexpr auto CLASS_NAME = _T("MediaKeysTrayClass");
+constexpr auto REG_RUN_PATH = _T("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+constexpr auto APP_NAME = _T("Media Keys");
 
 NOTIFYICONDATA g_nid = {};
 HINSTANCE g_hInstance = nullptr;
 HHOOK g_hKeyboardHook = nullptr;
+
+static bool IsAutostartEnabled()
+{
+	HKEY hKey;
+
+	if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_RUN_PATH, 0, KEY_READ, &hKey) == ERROR_SUCCESS)
+	{
+		TCHAR szValue[MAX_PATH]{};
+		DWORD dwSize = sizeof(szValue);
+		bool exists = RegQueryValueEx(hKey, APP_NAME, nullptr, nullptr, (LPBYTE)szValue, &dwSize) == ERROR_SUCCESS;
+		RegCloseKey(hKey);
+
+		return exists;
+	}
+
+	return false;
+}
+
+static bool SetAutostart(bool enable)
+{
+	HKEY hKey;
+
+	if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_RUN_PATH, 0, KEY_WRITE, &hKey) == ERROR_SUCCESS)
+	{
+		if (enable)
+		{
+			TCHAR szPath[MAX_PATH];
+			GetModuleFileName(nullptr, szPath, MAX_PATH);
+
+			LONG result = RegSetValueEx(hKey, APP_NAME, 0, REG_SZ, (LPBYTE)szPath, (lstrlen(szPath) + 1) * sizeof(TCHAR));
+			RegCloseKey(hKey);
+
+			return (result == ERROR_SUCCESS);
+		}
+		else
+		{
+			LONG result = RegDeleteValue(hKey, APP_NAME);
+			RegCloseKey(hKey);
+
+			return (result == ERROR_SUCCESS);
+		}
+	}
+
+	return false;
+}
 
 static void SendMediaKey(WORD key) {
 	INPUT input = { 0 };
@@ -88,6 +136,14 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 			GetCursorPos(&pt);
 
 			HMENU hMenu = CreatePopupMenu();
+
+			UINT autostartFlags = MF_STRING;
+			if (IsAutostartEnabled())
+			{
+				autostartFlags |= MF_CHECKED;
+			}
+			AppendMenu(hMenu, autostartFlags, ID_TRAY_AUTOSTART, _T("Autostart"));
+			AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
 			AppendMenu(hMenu, MF_STRING, ID_TRAY_EXIT, _T("Exit"));
 
 			SetForegroundWindow(hwnd);
@@ -100,6 +156,11 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 		if (LOWORD(wParam) == ID_TRAY_EXIT)
 		{
 			PostQuitMessage(0);
+		}
+		else if (LOWORD(wParam) == ID_TRAY_AUTOSTART)
+		{
+			bool currentState = IsAutostartEnabled();
+			SetAutostart(!currentState);
 		}
 		break;
 
@@ -123,7 +184,7 @@ static bool CreateTrayIcon(HWND hwnd)
 	g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
 	g_nid.uCallbackMessage = WM_TRAYICON;
 	g_nid.hIcon = LoadIcon(g_hInstance, MAKEINTRESOURCE(IDI_ICON1));
-	lstrcpy(g_nid.szTip, _T("Media Keys"));
+	lstrcpy(g_nid.szTip, APP_NAME);
 
 	return Shell_NotifyIcon(NIM_ADD, &g_nid);
 }
@@ -139,7 +200,7 @@ static int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInst
 
 	RegisterClass(&wc);
 
-	HWND hwnd = CreateWindowEx(0, CLASS_NAME, _T("Media Keys"), WS_OVERLAPPEDWINDOW,
+	HWND hwnd = CreateWindowEx(0, CLASS_NAME, APP_NAME, WS_OVERLAPPEDWINDOW,
 		CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
 		nullptr, nullptr, hInstance, nullptr);
 
