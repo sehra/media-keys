@@ -5,9 +5,9 @@
 
 #define WM_TRAYICON (WM_USER + 1)
 constexpr auto ID_TRAY_EXIT = 1001;
+constexpr auto CLASS_NAME = _T("MediaKeysTrayClass");
 
-const TCHAR* CLASS_NAME = _T("MediaKeysWindowClass");
-NOTIFYICONDATA nid = {};
+NOTIFYICONDATA g_nid = {};
 HINSTANCE g_hInstance = nullptr;
 HHOOK g_hKeyboardHook = nullptr;
 
@@ -74,7 +74,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 		}
 	}
 
-	return CallNextHookEx(NULL, nCode, wParam, lParam);
+	return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -91,7 +91,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 			AppendMenu(hMenu, MF_STRING, ID_TRAY_EXIT, _T("Exit"));
 
 			SetForegroundWindow(hwnd);
-			TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
+			TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, nullptr);
 			DestroyMenu(hMenu);
 		}
 		break;
@@ -104,7 +104,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 		break;
 
 	case WM_DESTROY:
-		Shell_NotifyIcon(NIM_DELETE, &nid);
+		Shell_NotifyIcon(NIM_DELETE, &g_nid);
 		PostQuitMessage(0);
 		break;
 
@@ -117,15 +117,15 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 
 static bool CreateTrayIcon(HWND hwnd)
 {
-	nid.cbSize = sizeof(NOTIFYICONDATA);
-	nid.hWnd = hwnd;
-	nid.uID = 1;
-	nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-	nid.uCallbackMessage = WM_TRAYICON;
-	nid.hIcon = LoadIcon(g_hInstance, MAKEINTRESOURCE(IDI_ICON1));
-	lstrcpy(nid.szTip, _T("Media Keys"));
+	g_nid.cbSize = sizeof(NOTIFYICONDATA);
+	g_nid.hWnd = hwnd;
+	g_nid.uID = 1;
+	g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+	g_nid.uCallbackMessage = WM_TRAYICON;
+	g_nid.hIcon = LoadIcon(g_hInstance, MAKEINTRESOURCE(IDI_ICON1));
+	lstrcpy(g_nid.szTip, _T("Media Keys"));
 
-	return Shell_NotifyIcon(NIM_ADD, &nid);
+	return Shell_NotifyIcon(NIM_ADD, &g_nid);
 }
 
 static int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPSTR lpCmdLine, _In_ int nCmdShow)
@@ -141,9 +141,9 @@ static int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInst
 
 	HWND hwnd = CreateWindowEx(0, CLASS_NAME, _T("Media Keys"), WS_OVERLAPPEDWINDOW,
 		CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-		NULL, NULL, hInstance, NULL);
+		nullptr, nullptr, hInstance, nullptr);
 
-	if (hwnd == NULL)
+	if (hwnd == nullptr)
 	{
 		return 1;
 	}
@@ -153,7 +153,7 @@ static int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInst
 		return 1;
 	}
 
-	g_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
+	g_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(nullptr), 0);
 
 	if (!g_hKeyboardHook)
 	{
@@ -162,7 +162,7 @@ static int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInst
 
 	MSG msg = {};
 
-	while (GetMessage(&msg, NULL, 0, 0))
+	while (GetMessage(&msg, nullptr, 0, 0))
 	{
 		TranslateMessage(&msg);
 		DispatchMessage(&msg);
