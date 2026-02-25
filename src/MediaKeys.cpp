@@ -1,30 +1,27 @@
 #include <windows.h>
+#include <windowsx.h>
 #include <shellapi.h>
 #include <array>
+#include <ranges>
 #include <utility>
 #include "resource.h"
+#include "UniqueHandle.h"
 
-constexpr UINT WM_TRAYICON = WM_USER + 1;
-constexpr UINT ID_TRAY_AUTOSTART = 1000;
-constexpr UINT ID_TRAY_EXIT = 1001;
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+constexpr auto APP_NAME = L"Media Keys";
 constexpr auto CLASS_NAME = L"MediaKeysTrayClass";
 constexpr auto REG_RUN_PATH = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-constexpr auto APP_NAME = L"Media Keys";
 
-struct RegKey
-{
-	HKEY hKey = nullptr;
+constexpr UINT WM_TRAYICON = WM_USER + 1;
+constexpr UINT WM_SEND_MEDIA_KEY = WM_USER + 2;
+constexpr UINT ID_TRAY_AUTOSTART = 1000;
+constexpr UINT ID_TRAY_EXIT = 1001;
 
-	RegKey() = default;
-	RegKey(const RegKey&) = delete;
-	RegKey& operator=(const RegKey&) = delete;
-	~RegKey() { if (hKey) RegCloseKey(hKey); }
-
-	HKEY* put() noexcept { return &hKey; }
-	explicit operator bool() const noexcept { return hKey != nullptr; }
-};
-
-constexpr std::array<std::pair<DWORD, WORD>, 7> g_keyMappings = {{
+// Win + F1..F7 -> media / volume virtual-key codes
+constexpr std::array<std::pair<DWORD, WORD>, 7> keyMappings = { {
 	{ VK_F1, VK_MEDIA_PREV_TRACK },
 	{ VK_F2, VK_MEDIA_PLAY_PAUSE },
 	{ VK_F3, VK_MEDIA_STOP },
@@ -32,171 +29,248 @@ constexpr std::array<std::pair<DWORD, WORD>, 7> g_keyMappings = {{
 	{ VK_F5, VK_VOLUME_UP },
 	{ VK_F6, VK_VOLUME_DOWN },
 	{ VK_F7, VK_VOLUME_MUTE },
-}};
+} };
 
-NOTIFYICONDATA g_nid{};
-HINSTANCE g_hInstance = nullptr;
-HHOOK g_hKeyboardHook = nullptr;
+// ---------------------------------------------------------------------------
+// Application state
+// ---------------------------------------------------------------------------
 
-static bool IsAutostartEnabled()
+struct AppState
 {
-	RegKey key;
+	NOTIFYICONDATA nid{};
+	HINSTANCE hInstance = nullptr;
+	UINT wmTaskbarCreated = 0;
+};
 
-	if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_RUN_PATH, 0, KEY_READ, key.put()) != ERROR_SUCCESS)
+static HWND g_hwnd = nullptr;
+
+// ---------------------------------------------------------------------------
+// Registry helpers – autostart
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] static bool IsAutostartEnabled() noexcept
+{
+	HKEY raw = nullptr;
+	if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_RUN_PATH, 0, KEY_READ, &raw) != ERROR_SUCCESS)
 		return false;
+	RegKey key(raw);
 
 	wchar_t szValue[MAX_PATH]{};
 	DWORD dwSize = sizeof(szValue);
-	return RegQueryValueEx(key.hKey, APP_NAME, nullptr, nullptr,
-		reinterpret_cast<LPBYTE>(szValue), &dwSize) == ERROR_SUCCESS;
+	if (RegQueryValueEx(key.get(), APP_NAME, nullptr, nullptr,
+		reinterpret_cast<LPBYTE>(szValue), &dwSize) != ERROR_SUCCESS)
+		return false;
+
+	wchar_t szPath[MAX_PATH]{};
+	if (GetModuleFileName(nullptr, szPath, MAX_PATH) == 0)
+		return false;
+
+	return _wcsicmp(szValue, szPath) == 0;
 }
 
-static bool SetAutostart(bool enable)
+[[nodiscard]] static bool SetAutostart(bool enable) noexcept
 {
-	RegKey key;
-
-	if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_RUN_PATH, 0, KEY_WRITE, key.put()) != ERROR_SUCCESS)
+	HKEY raw = nullptr;
+	if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_RUN_PATH, 0, KEY_WRITE, &raw) != ERROR_SUCCESS)
 		return false;
+	RegKey key(raw);
 
 	if (enable)
 	{
 		wchar_t szPath[MAX_PATH]{};
-		GetModuleFileName(nullptr, szPath, MAX_PATH);
+		const DWORD len = GetModuleFileName(nullptr, szPath, MAX_PATH);
+		if (len == 0 || len >= MAX_PATH)
+			return false;
 
-		return RegSetValueEx(key.hKey, APP_NAME, 0, REG_SZ,
+		return RegSetValueEx(key.get(), APP_NAME, 0, REG_SZ,
 			reinterpret_cast<LPBYTE>(szPath),
 			static_cast<DWORD>((wcslen(szPath) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
 	}
 
-	return RegDeleteValue(key.hKey, APP_NAME) == ERROR_SUCCESS;
+	return RegDeleteValue(key.get(), APP_NAME) == ERROR_SUCCESS;
 }
 
-static void SendMediaKey(WORD vk)
-{
-	INPUT input{};
-	input.type = INPUT_KEYBOARD;
-	input.ki.wVk = vk;
-	SendInput(1, &input, sizeof(INPUT));
+// ---------------------------------------------------------------------------
+// Media key simulation
+// ---------------------------------------------------------------------------
 
-	input.ki.dwFlags = KEYEVENTF_KEYUP;
-	SendInput(1, &input, sizeof(INPUT));
+static void SendMediaKey(WORD vk) noexcept
+{
+	std::array<INPUT, 2> inputs{};
+	inputs[0].type = INPUT_KEYBOARD;
+	inputs[0].ki.wVk = vk;
+	inputs[1].type = INPUT_KEYBOARD;
+	inputs[1].ki.wVk = vk;
+	inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+	SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
 }
 
-static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
+// ---------------------------------------------------------------------------
+// Low-level keyboard hook
+// ---------------------------------------------------------------------------
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) noexcept
 {
-	if (nCode == HC_ACTION)
+	if (nCode < 0)
+		return CallNextHookEx(nullptr, nCode, wParam, lParam);
+
+	const auto* pkb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+
+	if (pkb->flags & LLKHF_INJECTED)
+		return CallNextHookEx(nullptr, nCode, wParam, lParam);
+
+	static bool lWinHeld = false;
+	static bool rWinHeld = false;
+
+	const bool keyDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+
+	if (pkb->vkCode == VK_LWIN) { lWinHeld = keyDown; return CallNextHookEx(nullptr, nCode, wParam, lParam); }
+	if (pkb->vkCode == VK_RWIN) { rWinHeld = keyDown; return CallNextHookEx(nullptr, nCode, wParam, lParam); }
+
+	if (lWinHeld || rWinHeld)
 	{
-		auto* pkb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
-		bool winDown = (GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000);
+		const auto it = std::ranges::find_if(keyMappings,
+			[vk = pkb->vkCode](const auto& mapping) { return mapping.first == vk; });
 
-		if (winDown)
+		if (it != keyMappings.end())
 		{
-			for (const auto& [trigger, media] : g_keyMappings)
-			{
-				if (pkb->vkCode == trigger)
-				{
-					if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
-						SendMediaKey(media);
-					return 1;
-				}
-			}
+			if (keyDown)
+				PostMessage(g_hwnd, WM_SEND_MEDIA_KEY, it->second, 0);
+			return 1;
 		}
 	}
 
 	return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 
+// ---------------------------------------------------------------------------
+// Window procedure & tray icon
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] static AppState* GetAppState(HWND hwnd) noexcept
+{
+	return reinterpret_cast<AppState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+}
+
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
+	if (uMsg == WM_NCCREATE)
+	{
+		auto* cs = reinterpret_cast<CREATESTRUCT*>(lParam);
+		SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+		return DefWindowProc(hwnd, uMsg, wParam, lParam);
+	}
+
+	auto* state = GetAppState(hwnd);
+	if (!state)
+		return DefWindowProc(hwnd, uMsg, wParam, lParam);
+
 	switch (uMsg)
 	{
+	case WM_SEND_MEDIA_KEY:
+		SendMediaKey(static_cast<WORD>(wParam));
+		break;
+
 	case WM_TRAYICON:
-		if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP)
+		if (LOWORD(lParam) == WM_CONTEXTMENU || LOWORD(lParam) == NIN_SELECT || LOWORD(lParam) == NIN_KEYSELECT)
 		{
-			POINT pt{};
-			GetCursorPos(&pt);
+			POINT pt{ GET_X_LPARAM(wParam), GET_Y_LPARAM(wParam) };
 
-			HMENU hMenu = CreatePopupMenu();
+			Menu menu(CreatePopupMenu());
 
-			UINT autostartFlags = MF_STRING | (IsAutostartEnabled() ? MF_CHECKED : 0u);
-			AppendMenu(hMenu, autostartFlags, ID_TRAY_AUTOSTART, L"Autostart");
-			AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
-			AppendMenu(hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit");
+			const UINT autostartFlags = MF_STRING | (IsAutostartEnabled() ? MF_CHECKED : 0u);
+			AppendMenu(menu.get(), autostartFlags, ID_TRAY_AUTOSTART, L"Autostart");
+			AppendMenu(menu.get(), MF_SEPARATOR, 0, nullptr);
+			AppendMenu(menu.get(), MF_STRING, ID_TRAY_EXIT, L"Exit");
 
 			SetForegroundWindow(hwnd);
-			TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, nullptr);
-			DestroyMenu(hMenu);
+			TrackPopupMenu(menu.get(), TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, nullptr);
 		}
 		break;
 
 	case WM_COMMAND:
 		if (LOWORD(wParam) == ID_TRAY_EXIT)
 		{
-			PostQuitMessage(0);
+			DestroyWindow(hwnd);
 		}
 		else if (LOWORD(wParam) == ID_TRAY_AUTOSTART)
 		{
-			bool currentState = IsAutostartEnabled();
-			SetAutostart(!currentState);
+			const bool currentState = IsAutostartEnabled();
+			(void)SetAutostart(!currentState);
 		}
 		break;
 
 	case WM_DESTROY:
-		Shell_NotifyIcon(NIM_DELETE, &g_nid);
+		Shell_NotifyIcon(NIM_DELETE, &state->nid);
 		PostQuitMessage(0);
 		break;
 
 	default:
+		if (uMsg == state->wmTaskbarCreated)
+		{
+			Shell_NotifyIcon(NIM_ADD, &state->nid);
+			Shell_NotifyIcon(NIM_SETVERSION, &state->nid);
+			return 0;
+		}
 		return DefWindowProc(hwnd, uMsg, wParam, lParam);
 	}
 
 	return 0;
 }
 
-static bool CreateTrayIcon(HWND hwnd)
+[[nodiscard]] static bool CreateTrayIcon(HWND hwnd, AppState& state) noexcept
 {
-	g_nid.cbSize = sizeof(NOTIFYICONDATA);
-	g_nid.hWnd = hwnd;
-	g_nid.uID = 1;
-	g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-	g_nid.uCallbackMessage = WM_TRAYICON;
-	g_nid.hIcon = LoadIcon(g_hInstance, MAKEINTRESOURCE(IDI_ICON1));
-	wcscpy_s(g_nid.szTip, APP_NAME);
+	state.nid.cbSize = sizeof(NOTIFYICONDATA);
+	state.nid.hWnd = hwnd;
+	state.nid.uID = 1;
+	state.nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+	state.nid.uCallbackMessage = WM_TRAYICON;
+	state.nid.hIcon = LoadIcon(state.hInstance, MAKEINTRESOURCE(IDI_ICON1));
+	wcsncpy_s(state.nid.szTip, _countof(state.nid.szTip), APP_NAME, _TRUNCATE);
 
-	return Shell_NotifyIcon(NIM_ADD, &g_nid);
+	if (!Shell_NotifyIcon(NIM_ADD, &state.nid))
+		return false;
+
+	state.nid.uVersion = NOTIFYICON_VERSION_4;
+	return Shell_NotifyIcon(NIM_SETVERSION, &state.nid);
 }
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
 
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow)
 {
-	g_hInstance = hInstance;
+	Handle instanceMutex(CreateMutex(nullptr, TRUE, L"MediaKeys_SingleInstance"));
+	const DWORD mutexErr = GetLastError();
+	if (!instanceMutex || mutexErr == ERROR_ALREADY_EXISTS)
+		return EXIT_SUCCESS;
 
-	WNDCLASS wc = {};
+	AppState state;
+	state.hInstance = hInstance;
+	state.wmTaskbarCreated = RegisterWindowMessage(L"TaskbarCreated");
+
+	WNDCLASS wc{};
 	wc.lpfnWndProc = WindowProc;
 	wc.hInstance = hInstance;
 	wc.lpszClassName = CLASS_NAME;
 
 	RegisterClass(&wc);
 
-	HWND hwnd = CreateWindowEx(0, CLASS_NAME, APP_NAME, WS_OVERLAPPEDWINDOW,
+	g_hwnd = CreateWindowEx(0, CLASS_NAME, APP_NAME, WS_OVERLAPPEDWINDOW,
 		CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-		nullptr, nullptr, hInstance, nullptr);
+		nullptr, nullptr, hInstance, &state);
 
-	if (hwnd == nullptr)
-	{
-		return 1;
-	}
+	if (g_hwnd == nullptr)
+		return EXIT_FAILURE;
 
-	if (!CreateTrayIcon(hwnd))
-	{
-		return 1;
-	}
+	if (!CreateTrayIcon(g_hwnd, state))
+		return EXIT_FAILURE;
 
-	g_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(nullptr), 0);
+	Hook keyboardHook(SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(nullptr), 0));
 
-	if (!g_hKeyboardHook)
-	{
-		return 1;
-	}
+	if (!keyboardHook)
+		return EXIT_FAILURE;
 
 	MSG msg{};
 
@@ -206,11 +280,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 		DispatchMessage(&msg);
 	}
 
-	if (g_hKeyboardHook)
-	{
-		UnhookWindowsHookEx(g_hKeyboardHook);
-		g_hKeyboardHook = nullptr;
-	}
+	UnregisterClass(CLASS_NAME, hInstance);
 
-	return 0;
+	return EXIT_SUCCESS;
 }
