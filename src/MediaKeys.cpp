@@ -2,7 +2,6 @@
 #include <windowsx.h>
 #include <shellapi.h>
 #include <array>
-#include <ranges>
 #include <utility>
 #include "resource.h"
 #include "UniqueHandle.h"
@@ -114,28 +113,24 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 	if (nCode < 0)
 		return CallNextHookEx(nullptr, nCode, wParam, lParam);
 
+	const bool keyDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
 	const auto* pkb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
 
 	if (pkb->flags & LLKHF_INJECTED)
 		return CallNextHookEx(nullptr, nCode, wParam, lParam);
 
-	static bool lWinHeld = false;
-	static bool rWinHeld = false;
+	const auto it = std::find_if(keyMappings.begin(), keyMappings.end(),
+		[pkb](const auto& mapping) { return mapping.first == pkb->vkCode; });
 
-	const bool keyDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
-
-	if (pkb->vkCode == VK_LWIN) { lWinHeld = keyDown; return CallNextHookEx(nullptr, nCode, wParam, lParam); }
-	if (pkb->vkCode == VK_RWIN) { rWinHeld = keyDown; return CallNextHookEx(nullptr, nCode, wParam, lParam); }
-
-	if (lWinHeld || rWinHeld)
+	if (it != keyMappings.end())
 	{
-		const auto it = std::ranges::find_if(keyMappings,
-			[vk = pkb->vkCode](const auto& mapping) { return mapping.first == vk; });
+		const bool winHeld =
+			(GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+			(GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
 
-		if (it != keyMappings.end())
+		if (keyDown && winHeld)
 		{
-			if (keyDown)
-				PostMessage(g_hwnd, WM_SEND_MEDIA_KEY, it->second, 0);
+			PostMessage(g_hwnd, WM_SEND_MEDIA_KEY, it->second, 0);
 			return 1;
 		}
 	}
